@@ -187,10 +187,29 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                     if (!product.imageUri.isNullOrEmpty() && !product.imageUri.startsWith("http")) {
                         try {
                             val fileUri = Uri.parse(product.imageUri)
+                            // Use a more robust check for local files
+                            val file = if (fileUri.scheme == "file") {
+                                File(fileUri.path!!)
+                            } else if (fileUri.scheme == "content") {
+                                // For content URIs, we might need to copy to a temp file or use stream
+                                null 
+                            } else null
+
                             val imageRef = storageRef.child("products").child("${product.id}.jpg")
-                            imageRef.putFile(fileUri).await()
+                            
+                            // Try putting file directly, or use stream if it's a content URI
+                            if (file != null && file.exists()) {
+                                imageRef.putFile(Uri.fromFile(file)).await()
+                            } else {
+                                getApplication<Application>().contentResolver.openInputStream(fileUri)?.use { 
+                                    imageRef.putStream(it).await()
+                                }
+                            }
                             product.copy(imageUri = imageRef.downloadUrl.await().toString())
-                        } catch (e: Exception) { product }
+                        } catch (e: Exception) { 
+                            e.printStackTrace()
+                            product 
+                        }
                     } else product
                 }
 
@@ -199,9 +218,15 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                         try {
                             val fileUri = Uri.parse(customer.imageUri)
                             val imageRef = storageRef.child("customers").child("${customer.name}.jpg")
-                            imageRef.putFile(fileUri).await()
+                            
+                            getApplication<Application>().contentResolver.openInputStream(fileUri)?.use { 
+                                imageRef.putStream(it).await()
+                            }
                             customer.copy(imageUri = imageRef.downloadUrl.await().toString())
-                        } catch (e: Exception) { customer }
+                        } catch (e: Exception) { 
+                            e.printStackTrace()
+                            customer 
+                        }
                     } else customer
                 }
 
