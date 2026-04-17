@@ -1,5 +1,13 @@
 package com.altstudio.kirana
 
+import android.util.Log
+import kotlinx.coroutines.withTimeout
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -166,11 +174,53 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
     // This avoids subcollections entirely, so standard security rules
     // (match /users/{docId}) cover everything without needing {document=**}.
     private val CHUNK_SIZE = 500
+    private val NOTIFICATION_ID = 1001
+    private val CHANNEL_ID = "backup_channel"
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val name = "Cloud Backup"
+            val descriptionText = "Shows progress of data backup to cloud"
+            val importance = NotificationManager.IMPORTANCE_LOW
+            val channel = NotificationChannel(CHANNEL_ID, name, importance).apply {
+                description = descriptionText
+            }
+            val notificationManager: NotificationManager =
+                getApplication<Application>().getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun updateNotification(progress: Int, max: Int, message: String) {
+        val builder = NotificationCompat.Builder(getApplication(), CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground) // Ensure this exists or use a default icon
+            .setContentTitle("Cloud Backup")
+            .setContentText(message)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setProgress(max, progress, false)
+            .setOngoing(progress < max)
+
+        with(NotificationManagerCompat.from(getApplication())) {
+            try {
+                notify(NOTIFICATION_ID, builder.build())
+            } catch (e: SecurityException) {
+                // Handle missing permission
+            }
+        }
+    }
 
     fun syncToCloud(onResult: (String) -> Unit) {
-        val user = currentUser.value ?: return onResult("Not logged in")
+        val user = currentUser.value
+        if (user == null) {
+            Log.e("KiranaBackup", "User is null in syncToCloud")
+            return onResult("Error: Not logged in to Firebase")
+        }
+        
+        Log.d("KiranaBackup", "Starting backup for user: ${user.uid}")
+        createNotificationChannel()
         viewModelScope.launch {
             try {
+                updateNotification(0, 100, "Initializing backup...")
                 db.enableNetwork().await()
                 val col = db.collection("users")
                 val uid = user.uid
@@ -181,29 +231,21 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                 val repayments = repository.getAllRepaymentsList()
                 val saleItems = repository.getAllSaleItemsList()
                 val customers = repository.allCustomers.first()
+                
+                val totalItems = products.size + customers.size + invoices.size + repayments.size + saleItems.size
+                var itemsProcessed = 0
+
+                updateNotification(5, 100, "Uploading product images...")
 
                 // 1. Upload Images to Firebase Storage and update URIs
-                val updatedProducts = products.map { product ->
-                    if (!product.imageUri.isNullOrEmpty() && !product.imageUri.startsWith("http")) {
+                val updatedProducts = products.mapIndexed { index, product ->
+                    val result = if (!product.imageUri.isNullOrEmpty() && !product.imageUri.startsWith("http")) {
                         try {
                             val fileUri = Uri.parse(product.imageUri)
-                            // Use a more robust check for local files
-                            val file = if (fileUri.scheme == "file") {
-                                File(fileUri.path!!)
-                            } else if (fileUri.scheme == "content") {
-                                // For content URIs, we might need to copy to a temp file or use stream
-                                null 
-                            } else null
-
                             val imageRef = storageRef.child("products").child("${product.id}.jpg")
                             
-                            // Try putting file directly, or use stream if it's a content URI
-                            if (file != null && file.exists()) {
-                                imageRef.putFile(Uri.fromFile(file)).await()
-                            } else {
-                                getApplication<Application>().contentResolver.openInputStream(fileUri)?.use { 
-                                    imageRef.putStream(it).await()
-                                }
+                            getApplication<Application>().contentResolver.openInputStream(fileUri)?.use { 
+                                imageRef.putStream(it).await()
                             }
                             product.copy(imageUri = imageRef.downloadUrl.await().toString())
                         } catch (e: Exception) { 
@@ -211,10 +253,17 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                             product 
                         }
                     } else product
+                    
+                    itemsProcessed++
+                    if (index % 5 == 0) {
+                        updateNotification((itemsProcessed * 40 / products.size).coerceIn(5, 40), 100, "Uploading product images ($itemsProcessed/${products.size})")
+                    }
+                    result
                 }
 
-                val updatedCustomers = customers.map { customer ->
-                    if (!customer.imageUri.isNullOrEmpty() && !customer.imageUri.startsWith("http")) {
+                updateNotification(45, 100, "Uploading customer images...")
+                val updatedCustomers = customers.mapIndexed { index, customer ->
+                    val result = if (!customer.imageUri.isNullOrEmpty() && !customer.imageUri.startsWith("http")) {
                         try {
                             val fileUri = Uri.parse(customer.imageUri)
                             val imageRef = storageRef.child("customers").child("${customer.name}.jpg")
@@ -228,21 +277,40 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                             customer 
                         }
                     } else customer
+                    
+                    if (index % 5 == 0) {
+                        updateNotification(45 + (index * 15 / customers.size).coerceIn(0, 15), 100, "Uploading customer images...")
+                    }
+                    result
                 }
+
+                updateNotification(60, 100, "Saving data to Firestore...")
+
+                val totalDataSteps = 6 // products, invoices, repayments, saleItems, customers, meta
+                var currentStep = 0
 
                 // Write a list as chunked sibling documents
                 suspend fun <T> writeChunked(tag: String, items: List<T>, toMap: (T) -> Map<String, Any?>) {
+                    currentStep++
+                    val stepProgress = 60 + (currentStep * 35 / totalDataSteps)
+                    updateNotification(stepProgress, 100, "Saving $tag data...")
+                    Log.d("KiranaBackup", "Starting writeChunked for $tag, items: ${items.size}")
+                    
                     val chunks = items.chunked(CHUNK_SIZE)
                     chunks.forEachIndexed { i, chunk ->
-                        col.document("${uid}_${tag}_$i")
-                            .set(mapOf("items" to chunk.map { toMap(it) })).await()
+                        withTimeout(30000) { // 30 second timeout per chunk
+                            col.document("${uid}_${tag}_$i")
+                                .set(mapOf("items" to chunk.map { toMap(it) })).await()
+                        }
                     }
-                    var i = chunks.size
-                    while (true) {
-                        val old = col.document("${uid}_${tag}_$i").get().await()
+                    
+                    // Efficient cleanup: Only check for 5 extra old chunks instead of while(true)
+                    // This prevents infinite loops if Firestore behaves unexpectedly
+                    for (i in chunks.size until (chunks.size + 5)) {
+                        val docRef = col.document("${uid}_${tag}_$i")
+                        val old = withTimeout(10000) { docRef.get().await() }
                         if (!old.exists()) break
-                        old.reference.delete().await()
-                        i++
+                        withTimeout(10000) { docRef.delete().await() }
                     }
                 }
 
@@ -284,17 +352,22 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                 val saleItemChunks = maxOf(1, (saleItems.size + CHUNK_SIZE - 1) / CHUNK_SIZE)
                 val customerChunks = maxOf(1, (customers.size + CHUNK_SIZE - 1) / CHUNK_SIZE)
 
-                col.document(uid).set(mapOf(
-                    "lastSync" to System.currentTimeMillis(),
-                    "productChunks" to productChunks,
-                    "invoiceChunks" to invoiceChunks,
-                    "repaymentChunks" to repaymentChunks,
-                    "saleItemChunks" to saleItemChunks,
-                    "customerChunks" to customerChunks
-                )).await()
+                withTimeout(20000) {
+                    col.document(uid).set(mapOf(
+                        "lastSync" to System.currentTimeMillis(),
+                        "productChunks" to productChunks,
+                        "invoiceChunks" to invoiceChunks,
+                        "repaymentChunks" to repaymentChunks,
+                        "saleItemChunks" to saleItemChunks,
+                        "customerChunks" to customerChunks
+                    )).await()
+                }
 
-                onResult("VERIFIED\n${updatedProducts.size} products backed up with images")
+                updateNotification(100, 100, "Backup Complete")
+                onResult("VERIFIED\n${updatedProducts.size} products backed up")
             } catch (e: Exception) {
+                Log.e("KiranaBackup", "Backup failed", e)
+                updateNotification(0, 100, "Backup Failed: ${e.localizedMessage}")
                 onResult("Backup failed: ${e.localizedMessage}")
             }
         }
