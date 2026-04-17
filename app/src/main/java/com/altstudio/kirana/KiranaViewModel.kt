@@ -294,12 +294,13 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                     currentStep++
                     val stepProgress = 60 + (currentStep * 35 / totalDataSteps)
                     updateNotification(stepProgress, 100, "Saving $tag data...")
-                    Log.d("KiranaBackup", "Starting writeChunked for $tag, items: ${items.size}")
                     
                     val chunks = items.chunked(CHUNK_SIZE)
                     chunks.forEachIndexed { i, chunk ->
-                        withTimeout(30000) { // 30 second timeout per chunk
-                            col.document("${uid}_${tag}_$i")
+                        val docName = "${uid}_${tag}_$i"
+                        Log.d("KiranaBackup", "Writing to path: users/$docName")
+                        withTimeout(30000) { 
+                            col.document(docName)
                                 .set(mapOf("items" to chunk.map { toMap(it) })).await()
                         }
                     }
@@ -367,6 +368,10 @@ class KiranaViewModel(application: Application) : AndroidViewModel(application) 
                 onResult("VERIFIED\n${updatedProducts.size} products backed up")
             } catch (e: Exception) {
                 Log.e("KiranaBackup", "Backup failed", e)
+                if (e.message?.contains("PERMISSION_DENIED") == true) {
+                    // Try to clear persistence if we have a permission issue
+                    try { db.clearPersistence() } catch(ex: Exception) {}
+                }
                 updateNotification(0, 100, "Backup Failed: ${e.localizedMessage}")
                 onResult("Backup failed: ${e.localizedMessage}")
             }
