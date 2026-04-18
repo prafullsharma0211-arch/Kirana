@@ -1,6 +1,7 @@
 package com.altstudio.kirana
 
 import android.Manifest
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -80,15 +81,26 @@ enum class AppDestinations(val label: String, val icon: ImageVector) {
 fun KiranaApp(viewModel: KiranaViewModel = viewModel()) {
     val context = LocalContext.current
     val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val cameraGranted = permissions[Manifest.permission.CAMERA] ?: false
+        val notificationGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions[Manifest.permission.POST_NOTIFICATIONS] ?: false
+        } else {
+            true
+        }
+
+        if (!cameraGranted) {
             Toast.makeText(context, "Camera permission is required for scanning barcodes", Toast.LENGTH_SHORT).show()
         }
     }
 
     LaunchedEffect(Unit) {
-        permissionLauncher.launch(Manifest.permission.CAMERA)
+        val permissions = mutableListOf(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        permissionLauncher.launch(permissions.toTypedArray())
     }
 
     var currentDestination by remember { mutableStateOf(AppDestinations.POS) }
@@ -408,6 +420,7 @@ fun AddProductScreen(viewModel: KiranaViewModel) {
 fun InventoryScreen(viewModel: KiranaViewModel) {
     val allProducts by viewModel.allProducts.collectAsState()
     var editingProduct by remember { mutableStateOf<Product?>(null) }
+    var productToDelete by remember { mutableStateOf<Product?>(null) }
     var searchQuery by remember { mutableStateOf("") }
     var showLowStockOnly by remember { mutableStateOf(false) }
 
@@ -463,7 +476,11 @@ fun InventoryScreen(viewModel: KiranaViewModel) {
 
         LazyColumn(modifier = Modifier.fillMaxSize()) {
             items(filteredProducts) { product ->
-                ProductInventoryItem(product, onEdit = { editingProduct = it })
+                ProductInventoryItem(
+                    product, 
+                    onEdit = { editingProduct = it },
+                    onDelete = { productToDelete = it }
+                )
             }
         }
     }
@@ -474,10 +491,34 @@ fun InventoryScreen(viewModel: KiranaViewModel) {
             editingProduct = null
         })
     }
+
+    if (productToDelete != null) {
+        AlertDialog(
+            onDismissRequest = { productToDelete = null },
+            title = { Text("Delete Product") },
+            text = { Text("Are you sure you want to delete ${productToDelete?.name}? This action cannot be undone.") },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        productToDelete?.let { viewModel.deleteProduct(it) }
+                        productToDelete = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { productToDelete = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
 }
 
 @Composable
-fun ProductInventoryItem(product: Product, onEdit: (Product) -> Unit) {
+fun ProductInventoryItem(product: Product, onEdit: (Product) -> Unit, onDelete: (Product) -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { onEdit(product) }) {
         Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             if (product.imageUri != null) {
@@ -492,7 +533,10 @@ fun ProductInventoryItem(product: Product, onEdit: (Product) -> Unit) {
                 Text("₹${product.salePrice}", fontWeight = FontWeight.Bold)
                 Text("Cost: ₹${product.purchasePrice}", style = MaterialTheme.typography.bodySmall)
             }
-            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.padding(start = 8.dp).size(20.dp))
+            IconButton(onClick = { onDelete(product) }) {
+                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
+            }
+            Icon(Icons.Default.Edit, contentDescription = null, modifier = Modifier.padding(start = 4.dp).size(20.dp))
         }
     }
 }
@@ -649,7 +693,17 @@ fun SaleScreen(viewModel: KiranaViewModel) {
                             scope.launch {
                                 val prod = viewModel.getProductByBarcode(code)
                                 if (prod != null) {
-                                    selectedProductForQuantity = prod
+                                    // Add product directly without asking for quantity
+                                    currentSaleItems.add(SaleItem(
+                                        invoiceId = 0,
+                                        productId = prod.id,
+                                        productName = prod.name,
+                                        quantity = 1.0,
+                                        salePrice = prod.salePrice,
+                                        purchasePrice = prod.purchasePrice,
+                                        totalAmount = prod.salePrice * 1.0
+                                    ))
+                                    Toast.makeText(context, "${prod.name} added", Toast.LENGTH_SHORT).show()
                                 } else {
                                     Toast.makeText(context, "Product not found", Toast.LENGTH_SHORT).show()
                                 }
